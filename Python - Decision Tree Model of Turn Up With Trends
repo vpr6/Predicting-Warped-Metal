@@ -1,0 +1,596 @@
+
+'''
+    Import all the necessarry libraries
+'''
+import numpy as np
+import pandas as pd
+from databricks.connect import DatabricksSession
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns 
+import sklearn as skl
+from sklearn import tree
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import RepeatedKFold
+from sklearn.datasets import make_regression
+'''
+    End import
+'''
+
+'''
+    Define function to add noise to data. 
+
+'''
+
+# Augment by adding Gaussian noise
+def add_noise(data, noise_level=0.1):
+    noisy_data = data.copy()
+    for col in noisy_data.select_dtypes(include=[np.number]).columns:
+        if(col != 'grade_index' and col != 'reqFlat'):
+            noisy_data[col] += noise_level * np.random.randn(len(noisy_data))
+            
+    return noisy_data
+
+
+
+'''
+    Get data and put in dataframe
+'''
+# Sample data
+spark = DatabricksSession.builder.getOrCreate()
+df_normalAuto = spark.read.table("pca_wash.mill_turnup_summary")
+
+#convert to pandas
+df = df_normalAuto.toPandas()
+
+#print data
+print(df)
+print(df['Time_finishedRolling'] )
+
+# Convert string to datetime
+df['Time_finishedRolling'] = df['Time_finishedRolling'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
+
+
+
+'''
+    Filter the data to ignore false measurements
+'''
+#Filter Data
+filtered_df = df[df['Time_finishedRolling'] > datetime.strptime('2024-6-01 00:17:03', '%Y-%m-%d %H:%M:%S')]
+filtered_df = df[df['Time_finishedRolling'] < datetime.strptime('2029-5-01 00:00:01', '%Y-%m-%d %H:%M:%S')]
+filtered_df = filtered_df[filtered_df['TotalTimeToFlatten'] > -0.1]
+filtered_df = filtered_df[filtered_df['TotalTimeToFlatten'] <100]
+filtered_df = filtered_df[filtered_df['TotalTimeToRoll'] > -0.1]
+filtered_df = filtered_df[filtered_df['TotalTimeToRoll'] < 100]
+#filtered_df = filtered_df[filtered_df['grade'] == '0337']
+#filtered_df = filtered_df[filtered_df['On_Wid'] > 50]
+
+
+#add a numeric grade index so that model can use grade
+filtered_df['grade_index'] = filtered_df.groupby('grade').ngroup()
+filtered_df=filtered_df.dropna()
+
+
+
+
+'''
+    Duplicate instances of turn up and use noise function to slightly alter the data.
+
+    Purpouse to emphasise times when there is turn up and offset the disproportionate ammount of non turn up examples.
+
+    Without this, the model tends to guess no turn up too often.
+
+    Goal is to bias more towards false positives (aka think there will be turn up but won't be). Default disproportionate amount of turn up examples biases towards false negative (aka think there won't be turn up but there is)
+
+'''
+Data = filtered_df
+ExtraData = filtered_df[filtered_df['TotalTimeToFlatten'] > 0.1] #creating duplicate data to counterbalance lack of training data on turn up events (don't want to just predict no turn up)
+AugmentedData = add_noise(ExtraData, noise_level=0.1)
+ExtraData = pd.concat([ExtraData, AugmentedData], ignore_index=True)
+AugmentedData = add_noise(ExtraData, noise_level=0.1)
+ExtraData = pd.concat([ExtraData, AugmentedData], ignore_index=True)
+AugmentedData = add_noise(ExtraData, noise_level=0.1)
+ExtraData = pd.concat([ExtraData, AugmentedData], ignore_index=True)
+
+
+
+'''
+    finde average time to flatten pieces
+'''
+avg_flattenTime = ExtraData['TotalTimeToFlatten'].mean()
+
+
+
+
+#not being used
+'''
+# Calculate quartiles
+Q1_flattenTime = np.percentile(ExtraData['TotalTimeToFlatten'], 25)
+Q2_flattenTime = np.percentile(ExtraData['TotalTimeToFlatten'], 50)  # Median
+Q3_flattenTime = np.percentile(ExtraData['TotalTimeToFlatten'], 75)
+
+# Calculate interquartile range (IQR)
+IQR = Q3_flattenTime - Q1_flattenTime
+
+# Calculate whiskers
+lower_whisker_flattenTime  = max(min(ExtraData['TotalTimeToFlatten']), Q1_flattenTime - (1.5 * (Q2_flattenTime-Q1_flattenTime)*2 ))
+upper_whisker_flattenTime  = min(max(ExtraData['TotalTimeToFlatten']), Q3_flattenTime + (1.5 * (Q3_flattenTime-Q2_flattenTime)*2 ))
+'''
+
+
+
+#save the orignal data
+original_Data = filtered_df
+
+#add the extra synthetic turn up examples to the model
+filtered_df = pd.concat([Data, ExtraData], ignore_index=True)
+
+
+
+
+
+
+
+
+
+
+
+#X_columns = filtered_df[filtered_df[['grade_index', 'On_Thick', 'On_Wid', 'On_Len', 'Off_Wid', 'Off_Len']].notnull().all#(axis=1)]
+#Y_column = filtered_df[filtered_df[['TotalTimeToFlatten']].notnull().all(axis=1)]
+
+
+
+'''
+    Define relevant input data to the model
+'''
+X_columns = filtered_df[['grade_index', 'On_Thick', 'On_Wid', 'On_Len', 'Off_Wid', 'Off_Len']]
+X_columns_clean = X_columns
+'''
+    Save non-supplemented (authentic) original data for future evaluation
+'''
+X_columns_orig = original_Data[['grade_index', 'On_Thick', 'On_Wid', 'On_Len', 'Off_Wid', 'Off_Len']]
+
+
+'''
+    Define relevant output data to the model
+'''
+Y_column = filtered_df[['TotalTimeToFlatten']]
+Y_column_orig = original_Data[['TotalTimeToFlatten']]
+#Y_column_clean = Y_column['Time_finishedRolling'].apply(lambda x: x.Time_finishedRolling)#.dropna()
+Y_column['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1, 0.001, 0.2, 0.5, 2,100], 
+                     labels=['No Turn Up', 'Little Turn Up', 'Moderate Turn Up', 'Significant Turn Up',
+                             'Severe Turn Up']) 
+
+Y_column['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1,0.1,100], 
+                    labels=['Little-to-no Turn Up', 'Significant Turn Up'])
+
+Y_column_orig['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1,0.1,100], 
+                    labels=['Little-to-no Turn Up', 'Significant Turn Up'])
+
+#Y_column['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1, 0.001, 0.5,100], 
+#                     labels=['No Turn Up', 'Some Turn Up', 'Significant Turn Up']) 
+Y_column_clean = Y_column['Label']
+Y_column_orig = Y_column_orig['Label']
+print(Y_column_clean)
+print(X_columns_clean)
+
+#Y_column_clean = Y_column_clean.astype({'TotalTimeToFlatten': float})
+print(Y_column_clean.dtypes)#
+print(X_columns_clean.dtypes)#
+
+X = np.array(X_columns_clean)
+Y = np.array(Y_column_clean)
+
+# Splitting the data
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+
+
+#Train Decision Tree Model for Turn Up
+clf_DT = tree.DecisionTreeClassifier()
+clf_DT = clf_DT.fit(X_train, y_train)
+
+
+'''
+    Print the model performance on training and test data (supplemented)
+'''
+print('The model is correct ',100*(clf_DT.score(X_train,y_train)), '% of the time for the TRAIN dataset.')
+print('The model is correct ',100*(clf_DT.score(X_test,y_test)), '% of the time for the TEST dataset.')
+
+
+# Neural network model not being used
+'''
+
+clf_NN = MLPClassifier(solver='lbfgs', alpha=1e-5,
+                    hidden_layer_sizes=(5, 2), random_state=1)
+clf_NN.fit(X_train, y_train)
+print(clf_NN.score(X_train,y_train))
+print(clf_NN.score(X_test,y_test))
+'''
+
+
+#filtered_df['numTurnUp'] = filtered_df.groupby('reqFlat')['TotalTimeToFlatten'].sum().reset_index()
+
+#month = filtered_df.groupby('month')['Time_finishedRolling'].mean().reset_index()
+#monthly_trends_flatTime = filtered_df.groupby('month')['TotalTimeToFlatten'].sum().reset_index()
+#monthly_trends_totTime = filtered_df.groupby('month')['TotalTimeToRoll'].sum().reset_index()
+
+
+#prediction_df = filtered_df.filter([['grade_index', 'On_Thick', 'On_Wid', 'On_Len', 'Off_Wid', 'Off_Len']])
+#filtered_df = filtered_df.assign(modelPrediction=lambda x: clf_DT.predict(np.array([[x.grade_index, x.On_Thick, x.On_Wid, x.On_Len, x.Off_Wid, x.Off_Len]])))
+
+
+'''
+    
+'''
+prediction_df = clf_DT.predict(X_columns_orig)
+print(prediction_df)
+
+prediction_df = pd.DataFrame(prediction_df, columns=['TurnupModelPrediction'])
+
+final_df = original_Data.join(prediction_df)
+
+
+print(final_df)
+
+
+'''
+    Print the performance of the model on the original data (NOT supplemented)
+'''
+X_orig = np.array(X_columns_orig)
+Y_orig = np.array(Y_column_orig)
+#display(final_df)
+print('The model is correct ',100*clf_DT.score(X_orig,Y_orig), '% of the time for the ORIGINAL dataset.')
+
+
+
+
+'''
+    Apply the average flattening time to instances where the model predicts turn up
+'''
+temp_data = pd.DataFrame(columns=['modelTurnUpTime'])
+for modelTurnUpTime in final_df['TurnupModelPrediction']:
+    if modelTurnUpTime == 'Significant Turn Up':
+        temp_data = pd.concat([temp_data, pd.DataFrame({'modelTurnUpTime': [avg_flattenTime]})], ignore_index=True)
+    else:
+        temp_data = pd.concat([temp_data, pd.DataFrame({'modelTurnUpTime': [0]})], ignore_index=True)
+final_df = final_df.join(temp_data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+'''
+
+%python
+import numpy as np
+import pandas as pd
+from databricks.connect import DatabricksSession
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns 
+import sklearn as skl
+'''
+# Sample data
+spark = DatabricksSession.builder.getOrCreate()
+mill_turnup_summary = spark.read.table("pca_wash.mill_turnup_summary")
+mill_auto_tracker = spark.read.table("pca_wash.mill_auto_tracker")
+
+#convert to pandas
+df1 = mill_turnup_summary.toPandas()
+df2 = mill_auto_tracker.toPandas()
+
+
+
+
+
+#join tables
+
+df = final_df.join(df2.set_index('C_PCE_TRK_NUM'), on='C_PCE_TRK_NUM')
+
+
+#print data
+print(df)
+print(df['Time_finishedRolling'] )
+
+# Convert string to datetime
+#df['Time_finishedRolling'] = df['Time_finishedRolling'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
+#df['Time_finishedRolling'] = df['Time_finishedRolling'].apply(lambda x: datetime.fromtimestamp(x))
+
+
+'''
+    Filter data for plotting purposes.
+'''
+
+#Filter Data
+filtered_df = df[df['Time_finishedRolling'] > datetime.strptime('2024-6-01 00:17:03', '%Y-%m-%d %H:%M:%S')]
+filtered_df = df[df['Time_finishedRolling'] < datetime.strptime('2029-6-01 00:00:01', '%Y-%m-%d %H:%M:%S')]
+filtered_df = filtered_df[filtered_df['TotalTimeToFlatten'] > -0.1]
+filtered_df = filtered_df[filtered_df['TotalTimeToFlatten'] <30]
+filtered_df = filtered_df[filtered_df['TotalTimeToRoll'] > -0.1]
+filtered_df = filtered_df[filtered_df['TotalTimeToRoll'] < 40]
+if(select_grade==1):
+    filtered_df = filtered_df[filtered_df['grade'] == grade_selection]
+#filtered_df = filtered_df[filtered_df['On_Wid'] > 50]
+
+filtered_df_manual = filtered_df[filtered_df['Auto_Passes'] < 1] #manual
+filtered_df_auto = filtered_df[filtered_df['Auto_Passes'] > 2] #partialAuto
+
+
+
+
+'''
+    Manual aggregate analysis
+'''
+#agregate data calculation 
+filtered_df_manual['month'] = filtered_df_manual['Time_finishedRolling'].dt.week
+month_manual = filtered_df_manual.groupby('month')['Time_finishedRolling'].mean().reset_index()
+monthly_trends_flatTime_manual = filtered_df_manual.groupby('month')['TotalTimeToFlatten'].sum().reset_index()
+monthly_trends_totTime_manual = filtered_df_manual.groupby('month')['TotalTimeToRoll'].sum().reset_index()
+monthly_trends_numPieces_manual = filtered_df_manual.groupby('month')['C_PCE_ID'].count().reset_index()
+monthly_trends_totModelFlatTime_manual = filtered_df_manual.groupby('month')['modelTurnUpTime'].sum().reset_index()
+monthly_trends_totModelFlatTime_manual['modelTurnUpTime'] = monthly_trends_totModelFlatTime_manual['modelTurnUpTime'].astype(float)
+#
+#monthly_trends = monthly_trends.assign(percTimeFlat=lambda x: x.TotalTimeToFlatten / x.TotalTimeToRoll * 100)
+
+#merging agregate data
+monthly_trends_manual = pd.merge(month_manual, monthly_trends_totTime_manual, on='month', how='inner')
+monthly_trends_manual = pd.merge(monthly_trends_manual, monthly_trends_flatTime_manual, on='month', how='inner')
+monthly_trends_manual = pd.merge(monthly_trends_manual, monthly_trends_numPieces_manual, on='month', how='inner')
+monthly_trends_manual = pd.merge(monthly_trends_manual, monthly_trends_totModelFlatTime_manual, on='month', how='inner')
+
+# Add a new column 'percTimeFlat'
+monthly_trends_manual = monthly_trends_manual.assign(percTimeFlat=lambda x: x.TotalTimeToFlatten / x.TotalTimeToRoll * 100)
+# Add a new column 'timePerRollingStep'
+monthly_trends_manual = monthly_trends_manual.assign(timePerRollingStep=lambda x: x.TotalTimeToRoll / x.C_PCE_ID * 100)
+
+#monthly_trends = monthly_trends.assign(percModelTimeFlat=lambda x: x.TotalTimeToFlatten -  x.modelTurnUpTime )
+monthly_trends_manual['diffModelTimeFlat'] = monthly_trends_manual['TotalTimeToFlatten'].astype(float) -  monthly_trends_manual['modelTurnUpTime'].astype(float)
+monthly_trends_manual['percModelTimeFlat'] = ((monthly_trends_manual['TotalTimeToFlatten'].astype(float) -  monthly_trends_manual['modelTurnUpTime'].astype(float)) / (monthly_trends_manual['modelTurnUpTime'].astype(float)+25) * 100)
+
+#monthly_trends = monthly_trends.sort_values(by='TotalTimeToFlatten')
+
+
+'''
+    Auto aggregate analysis
+'''
+#agregate data calculation 
+filtered_df_auto['month'] = filtered_df_auto['Time_finishedRolling'].dt.week
+month = filtered_df_auto.groupby('month')['Time_finishedRolling'].mean().reset_index()
+monthly_trends_flatTime = filtered_df_auto.groupby('month')['TotalTimeToFlatten'].sum().reset_index()
+monthly_trends_totTime = filtered_df_auto.groupby('month')['TotalTimeToRoll'].sum().reset_index()
+monthly_trends_numPieces = filtered_df_auto.groupby('month')['C_PCE_ID'].count().reset_index()
+monthly_trends_totModelFlatTime = filtered_df_auto.groupby('month')['modelTurnUpTime'].sum().reset_index()
+monthly_trends_totModelFlatTime['modelTurnUpTime'] = monthly_trends_totModelFlatTime['modelTurnUpTime'].astype(float)
+#
+#monthly_trends = monthly_trends.assign(percTimeFlat=lambda x: x.TotalTimeToFlatten / x.TotalTimeToRoll * 100)
+
+#merging agregate data
+monthly_trends = pd.merge(month, monthly_trends_totTime, on='month', how='inner')
+monthly_trends = pd.merge(monthly_trends, monthly_trends_flatTime, on='month', how='inner')
+monthly_trends = pd.merge(monthly_trends, monthly_trends_numPieces, on='month', how='inner')
+monthly_trends = pd.merge(monthly_trends, monthly_trends_totModelFlatTime, on='month', how='inner')
+
+# Add a new column 'percTimeFlat'
+monthly_trends = monthly_trends.assign(percTimeFlat=lambda x: x.TotalTimeToFlatten / x.TotalTimeToRoll * 100)
+# Add a new column 'timePerRollingStep'
+monthly_trends = monthly_trends.assign(timePerRollingStep=lambda x: x.TotalTimeToRoll / x.C_PCE_ID * 100)
+
+#monthly_trends = monthly_trends.assign(percModelTimeFlat=lambda x: x.TotalTimeToFlatten -  x.modelTurnUpTime )
+monthly_trends['diffModelTimeFlat'] = monthly_trends['TotalTimeToFlatten'].astype(float) -  monthly_trends['modelTurnUpTime'].astype(float)
+monthly_trends['percModelTimeFlat'] = ((monthly_trends['TotalTimeToFlatten'].astype(float) -  monthly_trends['modelTurnUpTime'].astype(float)) / (monthly_trends['modelTurnUpTime'].astype(float)+25) * 100)
+
+
+
+#monthly_trends = monthly_trends.sort_values(by='TotalTimeToFlatten')
+
+
+
+#print out data
+'''
+print(month)
+print(monthly_trends)
+print(month.count())
+print(monthly_trends.count())
+'''
+
+
+#m_df = pd.merge(month, monthly_trends, on='month', how='inner')
+m_df = monthly_trends
+m_df_manual = monthly_trends_manual
+
+
+print(m_df)
+# Adding labels and title
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='TotalTimeToFlatten', data=m_df, marker='o')
+plt.title('Monthly Turn Up - Total Time to Flatten Trend')
+plt.xlabel('Month')#
+plt.ylabel('Flattening Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+
+# Adding labels and title
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='percTimeFlat', data=m_df, marker='o')
+plt.title(' Monthly Turn Up - % Time to Flatten Trend')
+plt.xlabel('Month')#
+plt.ylabel('Flattening % of Rolling Time')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+# Adding labels and title
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='TotalTimeToRoll', data=m_df, marker='o')
+plt.title(' Monthly Turn Up - Total Rolling Time Trend')
+plt.xlabel('Month')#
+plt.ylabel('Rolling Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+# Adding labels and title
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='timePerRollingStep', data=m_df, marker='o',label = 'timePerRollingStep')
+plt.title(' Monthly Turn Up - Average Rolling Time Per Rolling Step Trend')
+plt.xlabel('Month')#
+plt.ylabel('Rolling Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+'''
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='TotalTimeToFlatten', data=m_df_manual+m_df, marker='o',label = 'Total Time To Flatten')
+sns.lineplot(x='Time_finishedRolling', y='modelTurnUpTime', data=m_df_manual, marker='o',label = 'Model Turn Up Time')
+#plt.legend(labels=['TotalTimeToFlatten', 'modelTurnUpTime'])#,loc='upper left'),fontsize=12)
+plt.legend(fontsize=12)
+plt.title('Weekly Turn Up (ALL) - Total Model Predicted Flattening Time Trend')
+plt.xlabel('Month')#
+plt.ylabel('Flattening Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+'''
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='TotalTimeToFlatten', data=m_df, marker='o',label = 'Total Time To Flatten')
+sns.lineplot(x='Time_finishedRolling', y='modelTurnUpTime', data=m_df, marker='o',label = 'Model Turn Up Time')
+#plt.legend(labels=['TotalTimeToFlatten', 'modelTurnUpTime'])#,loc='upper left'),fontsize=12)
+plt.legend(fontsize=12)
+plt.title('Weekly Turn Up (Partial/Fully Auto) - Total Model Predicted Flattening Time Trend')
+plt.xlabel('Month')#
+plt.ylabel('Flattening Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+
+
+
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='TotalTimeToFlatten', data=m_df_manual, marker='o',label = 'Total Time To Flatten')
+sns.lineplot(x='Time_finishedRolling', y='modelTurnUpTime', data=m_df_manual, marker='o',label = 'Model Turn Up Time')
+#plt.legend(labels=['TotalTimeToFlatten', 'modelTurnUpTime'])#,loc='upper left'),fontsize=12)
+plt.legend(fontsize=12)
+plt.title('Weekly Turn Up (Fully Manual) - Total Model Predicted Flattening Time Trend')
+plt.xlabel('Month')#
+plt.ylabel('Flattening Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='percModelTimeFlat', data=m_df, marker='o')
+plt.title(' Weekly Turn Up (Partial/Fully Auto) - % of Model Predicted Flattening Timep Trend')
+plt.xlabel('Month')#
+plt.ylabel('Rolling Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+plt.figure(figsize=(10, 6))
+sns.lineplot(x='Time_finishedRolling', y='percModelTimeFlat', data=m_df, marker='o',label = 'Auto % of Model Predicted Turn Up Time')
+sns.lineplot(x='Time_finishedRolling', y='percModelTimeFlat', data=m_df_manual, marker='o',label = 'Manual % of Model Predicted Turn Up Time')
+#plt.legend(labels=['TotalTimeToFlatten', 'modelTurnUpTime'])#,loc='upper left'),fontsize=12)
+plt.legend(fontsize=12)
+plt.title('Weekly Turn Up (Partial/Fully Auto) - % of Model Predicted Flattening Timep Trend')
+plt.xlabel('Month')#
+plt.ylabel('Flattening Time (Minutes)')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+# Display the plot
+plt.show()
+
+display(monthly_trends)
+#display(filtered_df_auto)#
+
+
+
+
+
+
+
+
+
+'''
+    Define relevant input data to the model
+'''
+X_columns = original_Data[['grade_index', 'On_Thick', 'On_Wid', 'On_Len', 'Off_Wid', 'Off_Len']]
+X_columns_clean = X_columns
+'''
+    Save non-supplemented (authentic) original data for future evaluation
+'''
+X_columns_orig = original_Data[['grade_index', 'On_Thick', 'On_Wid', 'On_Len', 'Off_Wid', 'Off_Len']]
+
+
+
+'''
+    Define relevant output data to the model
+'''
+Y_column = original_Data[['TotalTimeToFlatten']]
+Y_column_orig = original_Data[['TotalTimeToFlatten']]
+#Y_column_clean = Y_column['Time_finishedRolling'].apply(lambda x: x.Time_finishedRolling)#.dropna()
+Y_column['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1, 0.001, 0.2, 0.5, 2,100], 
+                     labels=['No Turn Up', 'Little Turn Up', 'Moderate Turn Up', 'Significant Turn Up',
+                             'Severe Turn Up']) 
+
+Y_column['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1,0.1,100], 
+                    labels=['Little-to-no Turn Up', 'Significant Turn Up'])
+
+Y_column_orig['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1,0.1,100], 
+                    labels=['Little-to-no Turn Up', 'Significant Turn Up'])
+
+#Y_column['Label'] = pd.cut(x=Y_column['TotalTimeToFlatten'], bins=[-0.1, 0.001, 0.5,100], 
+#                     labels=['No Turn Up', 'Some Turn Up', 'Significant Turn Up']) 
+Y_column_clean = Y_column['Label']
+Y_column_orig = Y_column_orig['Label']
+print(Y_column_clean)
+print(X_columns_clean)
+
+#Y_column_clean = Y_column_clean.astype({'TotalTimeToFlatten': float})
+print(Y_column_clean.dtypes)#
+print(X_columns_clean.dtypes)#
+
+X = np.array(X_columns_clean)
+Y = np.array(Y_column_clean)
+
+# Splitting the data
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+
+
+#Train Decision Tree Model for Turn Up
+clf_DT = tree.DecisionTreeClassifier()
+clf_DT = clf_DT.fit(X_train, y_train)
+
+
+'''
+    Print the model performance on training and test data (supplemented)
+'''
+print('The model is correct ',100*(clf_DT.score(X_train,y_train)), '% of the time for the TRAIN dataset.')
+print('The model is correct ',100*(clf_DT.score(X_test,y_test)), '% of the time for the TEST dataset.')
+
+prediction_df = clf_DT.predict(X_columns_orig)
+print(prediction_df)
+
+prediction_df = pd.DataFrame(prediction_df, columns=['TurnupModelPrediction'])
+
+final_df = original_Data.join(prediction_df)
+
+
+'''
+    Print the performance of the model on the original data (NOT supplemented)
+'''
+X_orig = np.array(X_columns_orig)
+Y_orig = np.array(Y_column_orig)
+#display(final_df)
+print('The model is correct ',100*clf_DT.score(X_orig,Y_orig), '% of the time for the ORIGINAL dataset.')
