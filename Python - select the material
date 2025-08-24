@@ -1,0 +1,14 @@
+
+#select the material type to plot turn-up trends over time
+
+'''
+list of grade examples:
+    TA05
+    AV05
+    DT38
+    0304L
+    0316L
+    ...
+'''
+select_grade = 1 #determine whether to filter by grade
+grade_selection = 'AV05' #grade to be filtered by
